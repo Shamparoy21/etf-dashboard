@@ -1,13 +1,14 @@
 name: Build ETF Dashboard
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:           # Manual run button
   schedule:
-    - cron: '0 * * * *'  # hourly
+    - cron: '0 * * * *'        # Hourly (UTC). Change if you like.
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,14 +21,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas playwright bs4 lxml requests
+          pip install pandas requests beautifulsoup4 lxml playwright
           python -m playwright install --with-deps chromium
 
       - name: Build data JSON
         run: |
           python scripts/fetch_and_build.py
 
-      - name: Commit & Push
+      - name: Commit & Push data
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
