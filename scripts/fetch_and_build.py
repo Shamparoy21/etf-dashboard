@@ -1,5 +1,5 @@
-# scripts/fetch_and_build.py  (resilient + debug prints)
-# Builds data/data.json with live data; prints per-source counts so we can diagnose quickly.
+# scripts/fetch_and_build.py  (resilient + debug prints, corrected)
+# Builds data/data.json with live data and won't fail on transient errors.
 
 import json, re, time
 from pathlib import Path
@@ -40,7 +40,7 @@ def categorize(amc, scheme):
         return "Smart Beta / Thematic"
     return "Other"
 
-# ---------- NSE (LTP/Volume) with cookie pre-warm + retries ----------
+# ---------- NSE (LTP/Volume) with cookie pre‑warm + retry ----------
 def fetch_nse():
     tries = 2
     for attempt in range(1, tries+1):
@@ -49,14 +49,15 @@ def fetch_nse():
                 browser = p.chromium.launch(args=["--disable-gpu","--no-sandbox"])
                 ctx = browser.new_context(user_agent=UA["User-Agent"])
                 page = ctx.new_page()
-                # Pre-warm cookies
-                page.goto("https://www.nseindia.com/", wait_until="domcontentloaded", timeout=180000)
+                # Pre‑warm cookies
+                page.goto(NSE_HOME, wait_until="domcontentloaded", timeout=180000)
                 page.wait_for_timeout(1500)
                 # ETF page
                 page.goto(NSE_URL, wait_until="domcontentloaded", timeout=180000)
                 page.wait_for_selector("table", timeout=15000)
                 html = page.content()
                 browser.close()
+
             soup = BeautifulSoup(html, "lxml")
             table = None
             for t in soup.find_all("table"):
@@ -64,12 +65,14 @@ def fetch_nse():
                 if any("symbol" in x for x in ths) and any("ltp" in x for x in ths):
                     table = t; break
             if not table: raise RuntimeError("NSE table not found")
+
             heads = [th.get_text(strip=True).lower() for th in table.select("thead th")]
             def col_idx(name):
                 for i,h in enumerate(heads):
                     if name in h: return i
                 return None
             i_sym = col_idx("symbol"); i_ltp = col_idx("ltp"); i_vol = col_idx("volume")
+
             rows=[]
             for tr in table.select("tbody tr"):
                 tds=[td.get_text(strip=True) for td in tr.find_all("td")]
@@ -99,8 +102,14 @@ def fetch_mirae():
         for tr in soup.select("table tbody tr"):
             tds=[td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) < 4: continue
-            rows.append({"AMC":"Mirae Asset","Scheme":tds[1],"Symbol":tds[0] or "",
-                         "iNAV":to_float(tds[2]),"Previous_NAV":to_float(tds[3]),"Source":"Mirae"})
+            rows.append({
+                "AMC":"Mirae Asset",
+                "Scheme":tds[1],
+                "Symbol":tds[0] or "",
+                "iNAV":to_float(tds[2]),
+                "Previous_NAV":to_float(tds[3]),
+                "Source":"Mirae"
+            })
         return pd.DataFrame(rows)
     except Exception as e:
         print(f"[WARN] Mirae fetch failed: {e}")
@@ -114,8 +123,14 @@ def fetch_nippon():
         for tr in soup.select("table tbody tr"):
             tds=[td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) < 3: continue
-            rows.append({"AMC":"Nippon India Mutual Fund","Scheme":tds[0],"Symbol":"",
-                         "iNAV":to_float(tds[1]),"Previous_NAV":to_float(tds[2]),"Source":"Nippon"})
+            rows.append({
+                "AMC":"Nippon India Mutual Fund",
+                "Scheme":tds[0],
+                "Symbol":"",
+                "iNAV":to_float(tds[1]),
+                "Previous_NAV":to_float(tds[2]),
+                "Source":"Nippon"
+            })
         return pd.DataFrame(rows)
     except Exception as e:
         print(f"[WARN] Nippon fetch failed: {e}")
@@ -129,8 +144,14 @@ def fetch_zerodha():
         for tr in soup.select("table tbody tr"):
             tds=[td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) < 3: continue
-            rows.append({"AMC":"Zerodha Fund House","Scheme":tds[0],"Symbol":"",
-                         "iNAV":to_float(tds[1]),"Previous_NAV":to_float(tds[2]),"Source":"Zerodha"})
+            rows.append({
+                "AMC":"Zerodha Fund House",
+                "Scheme":tds[0],
+                "Symbol":"",
+                "iNAV":to_float(tds[1]),
+                "Previous_NAV":to_float(tds[2]),
+                "Source":"Zerodha"
+            })
         return pd.DataFrame(rows)
     except Exception as e:
         print(f"[WARN] Zerodha fetch failed: {e}")
@@ -149,7 +170,7 @@ def build_dataset():
 
     amc = pd.concat([mirae, nippon, zero], ignore_index=True)
 
-    # If every AMC source came back empty, keep site alive with existing data.json
+    # If every AMC source is empty, keep site alive with previous data
     if amc.empty and (DATA_DIR/"data.json").exists():
         print("[FALLBACK] All AMC sources empty — using previous data.json")
         try:
@@ -157,7 +178,7 @@ def build_dataset():
                 prev = json.load(f)
             amc = pd.DataFrame(prev)[["AMC","Category","Scheme","Symbol","iNAV","Previous_NAV","Source"]]
         except Exception as e:
-            print(f"[WARN] Fallback read failed: {e}")
+            print(f"[WARN] fallback read failed: {e}")
             amc = pd.DataFrame(columns=["AMC","Scheme","Symbol","iNAV","Previous_NAV","Source"])
             amc["Category"]=""
 
@@ -177,7 +198,8 @@ def build_dataset():
     # History for sparklines
     snap = {"timestamp": NOW, "records": merged[["Symbol","Scheme","iNAV","AMC"]].to_dict(orient="records")}
     hist = HIST_DIR / f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
-    with open(hist,"w",encoding="utf-8") as f: json.dump(snap,f)
+    with open(hist,"w",encoding="utf-8") as f:
+        json.dump(snap,f,ensure_ascii=False)
 
     # Build compact spark arrays
     spark_map={}
@@ -195,10 +217,9 @@ def build_dataset():
           "LTP","Volume","PremLTPvsINAV","iNAV_hist","Timestamp","Source"]
     final = merged[cols].sort_values(["AMC","Category","Scheme"]).fillna("")
     with open(DATA_DIR/"data.json","w",encoding="utf-8") as f:
-        json.dump(final.to_dict(orient("records")), f, ensure_ascii=False)
+        json.dump(final.to_dict(orient="records"), f, ensure_ascii=False)
 
     print(f"[OK] Built data/data.json with {len(final)} rows")
 
 if __name__ == "__main__":
     build_dataset()
-``
