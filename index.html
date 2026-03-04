@@ -1,0 +1,223 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>India ETF Dashboard — iNAV vs NAV, LTP Premium (NSE)</title>
+  <style>
+    :root{
+      --fg:#111; --muted:#666; --pos:#0b7a28; --neg:#b00020; --bg:#fff; --grid:#e5e7eb;
+      --accent:#0b5cff; --chip:#f5f5f7; --chipb:#eaecef;
+    }
+    html,body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+    header{padding:16px 20px;border-bottom:1px solid var(--grid)}
+    h1{font-size:18px;margin:0 0 4px 0}
+    .sub{color:var(--muted);font-size:13px}
+    .bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:12px 0}
+    .chip{background:var(--chip);border:1px solid var(--chipb);padding:6px 10px;border-radius:999px;font-size:12px;cursor:pointer}
+    .chip.active{background:#e8f0ff;border-color:#c7daff;color:#0b3d91}
+    #search{padding:8px 10px;border:1px solid var(--grid);border-radius:8px;min-width:260px}
+    .wrap{padding:16px 20px}
+    table{border-collapse:collapse;width:100%}
+    th,td{border-bottom:1px solid var(--grid);padding:8px 10px;font-size:13px;text-align:left;vertical-align:top}
+    thead th{position:sticky;top:0;background:#fafafa;z-index:2}
+    tbody tr:nth-child(odd){background:#fff}
+    tbody tr:nth-child(even){background:#fcfcfc}
+    .num{text-align:right}
+    .pos{color:var(--pos)}
+    .neg{color:var(--neg)}
+    .muted{color:var(--muted)}
+    .spark{height:20px; width:80px}
+    .controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0 12px}
+    button.btn{padding:6px 10px;border:1px solid var(--grid);background:#fff;border-radius:8px;cursor:pointer}
+    button.btn:hover{background:#f6f8ff}
+    .right{margin-left:auto}
+    .pill{padding:2px 8px;border-radius:999px;border:1px solid var(--grid);font-size:12px}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>India ETF Dashboard — iNAV vs Previous NAV, and LTP vs iNAV (NSE)</h1>
+    <div class="sub">
+      • AMCs: Mirae Asset, Nippon India, Zerodha Fund House · iNAV is indicative and compared to previous-day official NAV.<br/>
+      • LTP & volumes from NSE ETF Market Watch; LTP–iNAV premium shows true trading deviation. Data auto-updates via GitHub Actions (configurable).
+    </div>
+    <div class="controls">
+      <input id="search" placeholder="Search AMC / Scheme / Symbol" />
+      <div class="right">
+        <button id="exportCsv" class="btn">Export CSV</button>
+        <span id="rows" class="pill">0 rows</span>
+      </div>
+    </div>
+    <div class="bar" id="filters"></div>
+  </header>
+
+  <div class="wrap">
+    <table id="grid">
+      <thead>
+        <tr>
+          <th data-key="AMC" class="sortable">AMC</th>
+          <th data-key="Category" class="sortable">Category</th>
+          <th data-key="Scheme" class="sortable">Scheme</th>
+          <th data-key="Symbol" class="sortable">Symbol</th>
+          <th data-key="iNAV" class="sortable num">iNAV (₹)</th>
+          <th data-key="Previous_NAV" class="sortable num">Prev NAV (₹)</th>
+          <th data-key="PremDiscPct" class="sortable num">iNAV vs Prev NAV %</th>
+          <th data-key="LTP" class="sortable num">LTP (₹)</th>
+          <th data-key="Volume" class="sortable num">Volume</th>
+          <th data-key="PremLTPvsINAV" class="sortable num">(LTP − iNAV)/iNAV %</th>
+          <th data-key="iNAV_spark" class="num">iNAV Spark</th>
+          <th data-key="Timestamp">Timestamp</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+<script>
+// ---------- Configuration ----------
+const CATEGORY_DEFS = [
+  {key:'Index',  test: s => /nifty\s?(50|100|200|next\s?50|midcap|sensex)/i.test(s)},
+  {key:'Sector', test: s => /(bank|psu|it|pharma|auto|metal|energy|infra|financial)/i.test(s)},
+  {key:'International', test: s => /(fang|hang\s?sheng|s&p|top\s?50)/i.test(s)},
+  {key:'Commodity', test: s => /(gold|silver)/i.test(s)},
+  {key:'Debt', test: s => /(g\-?sec|sdl|liquid|1d rate)/i.test(s)},
+  {key:'Smart Beta / Thematic', test: s => /(alpha|low volatility|momentum|quality|consumption|manufacturing|dividend|equal weight|internet|ev|new age)/i.test(s)},
+];
+const FILTER_ORDER = ['All','Index','Sector','International','Commodity','Debt','Smart Beta / Thematic'];
+
+// ---------- Data loading ----------
+// Primary path (for GitHub Actions): fetch external JSON file built by workflow
+async function loadData(){
+  try {
+    const r = await fetch('data/data.json', {cache:'no-cache'});
+    if (r.ok){
+      const j = await r.json();
+      return j;
+    }
+  } catch(e){ console.warn('Falling back to embedded DATA', e); }
+  return window.DATA || [];
+}
+
+// ---------- Helpers ----------
+const fmt = (x, d=6)=> (x===null||x===undefined||x==="")?"":Number(x).toLocaleString(undefined,{maximumFractionDigits:d});
+const pct = x => {
+  if(x===null||x===undefined||isNaN(Number(x))) return '';
+  const v = Number(x);
+  const cls = v>=0? 'pos':'neg';
+  return `<span class="${cls}">${v.toFixed(2)}%</span>`;
+}
+
+function categorize(row){
+  const s = `${row.AMC||''} ${row.Scheme||''}`;
+  for(const c of CATEGORY_DEFS){ if(c.test(s)) return c.key; }
+  return 'Other';
+}
+
+// Tiny sparkline (inline SVG)
+function spark(arr){
+  if(!arr || !arr.length) return '';
+  const w=80,h=20; const min = Math.min(...arr), max = Math.max(...arr);
+  const scaleX = i => (i/(arr.length-1))*w;
+  const scaleY = v => h - ((v-min)/(max-min||1))*h;
+  let d = '';
+  arr.forEach((v,i)=>{ d += (i? ' L':'M')+scaleX(i)+','+scaleY(v); });
+  const cls = (arr[arr.length-1] - arr[0])>=0? 'pos':'neg';
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}"><path d="${d}" fill="none" stroke="${cls==='pos'?'#0b7a28':'#b00020'}" stroke-width="1.5"/></svg>`;
+}
+
+// ---------- Rendering ----------
+let ALL=[], VIEW=[]; let currentCategory='All'; let sortKey='', sortDir=1;
+
+function buildFilters(){
+  const bar = document.getElementById('filters');
+  bar.innerHTML = '';
+  for(const key of FILTER_ORDER){
+    const el = document.createElement('div');
+    el.className = 'chip'+(key===currentCategory?' active':'');
+    el.textContent = key;
+    el.onclick = ()=>{ currentCategory = key; apply(); };
+    bar.appendChild(el);
+  }
+}
+
+function rowHtml(r){
+  return `<tr>
+    <td>${r.AMC||''}</td>
+    <td>${r.Category||''}</td>
+    <td>${r.Scheme||''}</td>
+    <td>${r.Symbol||''}</td>
+    <td class='num'>${fmt(r.iNAV)}</td>
+    <td class='num'>${fmt(r.Previous_NAV)}</td>
+    <td class='num'>${pct(r.PremDiscPct)}</td>
+    <td class='num'>${fmt(r.LTP)}</td>
+    <td class='num'>${fmt(r.Volume,0)}</td>
+    <td class='num'>${pct(r.PremLTPvsINAV)}</td>
+    <td class='num'>${spark(r.iNAV_hist)}</td>
+    <td class='muted'>${r.Timestamp||''}</td>
+  </tr>`
+}
+
+function render(){
+  const tb = document.querySelector('#grid tbody');
+  tb.innerHTML = VIEW.map(rowHtml).join('');
+  document.getElementById('rows').textContent = `${VIEW.length} rows`;
+}
+
+function apply(){
+  const q = (document.getElementById('search').value||'').toLowerCase();
+  VIEW = ALL
+    .filter(r => currentCategory==='All' || r.Category===currentCategory)
+    .filter(r => (`${r.AMC} ${r.Scheme} ${r.Symbol||''}`).toLowerCase().includes(q));
+  if(sortKey){ VIEW.sort((a,b)=> (a[sortKey]??'') > (b[sortKey]??'') ? sortDir : ((a[sortKey]??'')<(b[sortKey]??'')?-sortDir:0)); }
+  render();
+}
+
+function attachSorting(){
+  document.querySelectorAll('th.sortable').forEach(th => {
+    th.style.cursor='pointer';
+    th.addEventListener('click', () => {
+      const key = th.dataset.key; 
+      if(sortKey===key){ sortDir*=-1; } else { sortKey=key; sortDir=1; }
+      apply();
+    });
+  });
+}
+
+function exportCSV(){
+  const cols = ['AMC','Category','Scheme','Symbol','iNAV','Previous_NAV','PremDiscPct','LTP','Volume','PremLTPvsINAV','Timestamp','Source'];
+  const esc = s => (s==null?'':String(s).replaceAll('"','""'));
+  const lines = [cols.join(',')];
+  VIEW.forEach(r=>{
+    const row = cols.map(k=> esc(Array.isArray(r[k])? JSON.stringify(r[k]) : r[k]));
+    lines.push(row.join(','));
+  });
+  const blob = new Blob([lines.join('\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download='etf_inav_ltp_dashboard.csv'; a.click();
+}
+
+// ---------- Init ----------
+(async function(){
+  let data = await loadData();
+  // Enrich categories & computed fields
+  data = data.map(r => ({
+    ...r,
+    Category: r.Category || categorize(r),
+    PremDiscPct: r.PremDiscPct!=null? r.PremDiscPct : (r.iNAV && r.Previous_NAV? (r.iNAV/r.Previous_NAV - 1)*100 : null),
+    PremLTPvsINAV: (r.LTP && r.iNAV)? ((r.LTP/r.iNAV)-1)*100 : null,
+  }));
+  ALL = data; buildFilters(); attachSorting();
+  document.getElementById('search').addEventListener('input', apply);
+  document.getElementById('exportCsv').addEventListener('click', exportCSV);
+  apply();
+})();
+</script>
+
+<!-- Fallback embedded data (so the file works offline even if data/data.json is absent) -->
+<script>
+window.DATA = [];
+</script>
+</body>
+</html>
