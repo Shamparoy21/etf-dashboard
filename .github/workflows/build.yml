@@ -1,9 +1,9 @@
 name: Build ETF Dashboard
 
 on:
-  workflow_dispatch:           # Manual run button
+  workflow_dispatch:           # manual run button
   schedule:
-    - cron: '0 * * * *'        # Hourly (UTC). Change if you like.
+    - cron: '0 * * * *'        # hourly (UTC); change as you like
 
 jobs:
   build:
@@ -13,25 +13,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show repo tree
+        run: |
+          echo "=== REPO TREE ==="
+          ls -R
+          echo "=== CURRENT PATH ==="
+          pwd
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install dependencies (minimal first)
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests beautifulsoup4 lxml playwright
           python -m playwright install --with-deps chromium
+          echo "=== PIP FREEZE ==="
+          pip freeze
+
+      - name: Verify script presence
+        run: |
+          echo "=== SHOW scripts/fetch_and_build.py HEAD ==="
+          sed -n '1,120p' scripts/fetch_and_build.py || true
 
       - name: Build data JSON
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
+          set -e
           python scripts/fetch_and_build.py
+          echo "=== HEAD OF data/data.json ==="
+          sed -n '1,60p' data/data.json
 
       - name: Commit & Push data
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
           git add data/data.json history/*.json || true
-          git commit -m "Auto-update ETF data" || echo "No changes"
+          git commit -m "Auto-update ETF data" || echo "No changes to commit"
           git push
