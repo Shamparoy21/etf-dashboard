@@ -1,5 +1,5 @@
-# scripts/fetch_and_build.py (resilient to NSE timeouts)
-# Builds data/data.json with live data; keeps dashboard alive even if a source hiccups.
+# scripts/fetch_and_build.py  (resilient + debug prints)
+# Builds data/data.json with live data; prints per-source counts so we can diagnose quickly.
 
 import json, re, time
 from pathlib import Path
@@ -40,7 +40,7 @@ def categorize(amc, scheme):
         return "Smart Beta / Thematic"
     return "Other"
 
-# ------------------ NSE (LTP/Volume) with cookie pre-warm + retries ------------------
+# ---------- NSE (LTP/Volume) with cookie pre-warm + retries ----------
 def fetch_nse():
     tries = 2
     for attempt in range(1, tries+1):
@@ -49,35 +49,30 @@ def fetch_nse():
                 browser = p.chromium.launch(args=["--disable-gpu","--no-sandbox"])
                 ctx = browser.new_context(user_agent=UA["User-Agent"])
                 page = ctx.new_page()
-                # 1) pre-warm cookies
-                page.goto(NSE_HOME, wait_until="domcontentloaded", timeout=180_000)
+                # Pre-warm cookies
+                page.goto("https://www.nseindia.com/", wait_until="domcontentloaded", timeout=180000)
                 page.wait_for_timeout(1500)
-                # 2) now the ETF table
-                page.goto(NSE_URL, wait_until="domcontentloaded", timeout=180_000)
-                # wait for any table to appear
+                # ETF page
+                page.goto(NSE_URL, wait_until="domcontentloaded", timeout=180000)
                 page.wait_for_selector("table", timeout=15000)
                 html = page.content()
                 browser.close()
-
             soup = BeautifulSoup(html, "lxml")
             table = None
             for t in soup.find_all("table"):
                 ths = [th.get_text(strip=True).lower() for th in t.select("thead th")]
                 if any("symbol" in x for x in ths) and any("ltp" in x for x in ths):
                     table = t; break
-            if not table:
-                raise RuntimeError("NSE table not found")
-
+            if not table: raise RuntimeError("NSE table not found")
             heads = [th.get_text(strip=True).lower() for th in table.select("thead th")]
             def col_idx(name):
                 for i,h in enumerate(heads):
                     if name in h: return i
                 return None
             i_sym = col_idx("symbol"); i_ltp = col_idx("ltp"); i_vol = col_idx("volume")
-
             rows=[]
             for tr in table.select("tbody tr"):
-                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                tds=[td.get_text(strip=True) for td in tr.find_all("td")]
                 if not tds: continue
                 sym = tds[i_sym] if i_sym is not None else None
                 ltp = to_float(tds[i_ltp]) if i_ltp is not None else None
@@ -87,50 +82,40 @@ def fetch_nse():
         except Exception as e:
             print(f"[WARN] NSE attempt {attempt}/{tries} failed: {e}")
             time.sleep(2)
-    # final fallback
     return pd.DataFrame(columns=["Symbol","LTP","Volume"])
 
-# ------------------ AMC iNAV / Prev NAV ------------------
-def fetch_table_via_playwright(url, amc_name):
+# ---------- AMC fetchers ----------
+def fetch_mirae():
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(args=["--disable-gpu","--no-sandbox"])
             pg = browser.new_page()
-            pg.goto(url, wait_until="domcontentloaded", timeout=180_000)
+            pg.goto(MIRAE_URL, wait_until="domcontentloaded", timeout=180000)
             pg.wait_for_timeout(3000)
             html = pg.content()
             browser.close()
         soup = BeautifulSoup(html, "lxml")
         rows=[]
         for tr in soup.select("table tbody tr"):
-            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            tds=[td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) < 4: continue
-            rows.append({
-                "AMC": amc_name,
-                "Scheme": tds[1],
-                "Symbol": tds[0] or "",
-                "iNAV": to_float(tds[2]),
-                "Previous_NAV": to_float(tds[3]),
-                "Source": amc_name
-            })
+            rows.append({"AMC":"Mirae Asset","Scheme":tds[1],"Symbol":tds[0] or "",
+                         "iNAV":to_float(tds[2]),"Previous_NAV":to_float(tds[3]),"Source":"Mirae"})
         return pd.DataFrame(rows)
     except Exception as e:
-        print(f"[WARN] {amc_name} fetch failed: {e}")
+        print(f"[WARN] Mirae fetch failed: {e}")
         return pd.DataFrame(columns=["AMC","Scheme","Symbol","iNAV","Previous_NAV","Source"])
-
-def fetch_mirae():
-    return fetch_table_via_playwright(MIRAE_URL, "Mirae Asset")
 
 def fetch_nippon():
     try:
         r=requests.get(NIPPON_URL, headers=UA, timeout=60)
-        soup=BeautifulSoup(r.text,"lxml")
+        soup=BeautifulSoup(r.text, "lxml")
         rows=[]
         for tr in soup.select("table tbody tr"):
             tds=[td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) < 3: continue
-            rows.append({"AMC":"Nippon India Mutual Fund", "Scheme": tds[0], "Symbol": "",
-                         "iNAV": to_float(tds[1]), "Previous_NAV": to_float(tds[2]), "Source":"Nippon"})
+            rows.append({"AMC":"Nippon India Mutual Fund","Scheme":tds[0],"Symbol":"",
+                         "iNAV":to_float(tds[1]),"Previous_NAV":to_float(tds[2]),"Source":"Nippon"})
         return pd.DataFrame(rows)
     except Exception as e:
         print(f"[WARN] Nippon fetch failed: {e}")
@@ -139,34 +124,40 @@ def fetch_nippon():
 def fetch_zerodha():
     try:
         r=requests.get(ZERODHA_URL, headers=UA, timeout=60)
-        soup=BeautifulSoup(r.text,"lxml")
+        soup=BeautifulSoup(r.text, "lxml")
         rows=[]
         for tr in soup.select("table tbody tr"):
             tds=[td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) < 3: continue
-            rows.append({"AMC":"Zerodha Fund House", "Scheme": tds[0], "Symbol": "",
-                         "iNAV": to_float(tds[1]), "Previous_NAV": to_float(tds[2]), "Source":"Zerodha"})
+            rows.append({"AMC":"Zerodha Fund House","Scheme":tds[0],"Symbol":"",
+                         "iNAV":to_float(tds[1]),"Previous_NAV":to_float(tds[2]),"Source":"Zerodha"})
         return pd.DataFrame(rows)
     except Exception as e:
         print(f"[WARN] Zerodha fetch failed: {e}")
         return pd.DataFrame(columns=["AMC","Scheme","Symbol","iNAV","Previous_NAV","Source"])
 
-# ------------------ Build dataset ------------------
+# ---------- Build dataset ----------
 def build_dataset():
     nse    = fetch_nse()
+    print(f"[COUNT] NSE rows: {len(nse)}")
     mirae  = fetch_mirae()
+    print(f"[COUNT] Mirae rows: {len(mirae)}")
     nippon = fetch_nippon()
+    print(f"[COUNT] Nippon rows: {len(nippon)}")
     zero   = fetch_zerodha()
+    print(f"[COUNT] Zerodha rows: {len(zero)}")
 
     amc = pd.concat([mirae, nippon, zero], ignore_index=True)
+
+    # If every AMC source came back empty, keep site alive with existing data.json
     if amc.empty and (DATA_DIR/"data.json").exists():
-        # last-resort: keep site alive with previous data
+        print("[FALLBACK] All AMC sources empty — using previous data.json")
         try:
             with open(DATA_DIR/"data.json","r",encoding="utf-8") as f:
                 prev = json.load(f)
             amc = pd.DataFrame(prev)[["AMC","Category","Scheme","Symbol","iNAV","Previous_NAV","Source"]]
         except Exception as e:
-            print(f"[WARN] fallback read failed: {e}")
+            print(f"[WARN] Fallback read failed: {e}")
             amc = pd.DataFrame(columns=["AMC","Scheme","Symbol","iNAV","Previous_NAV","Source"])
             amc["Category"]=""
 
@@ -178,18 +169,17 @@ def build_dataset():
     if not nse.empty:
         merged = amc.merge(nse, how="left", on="Symbol")
     else:
-        merged = amc.copy()
-        merged["LTP"]=None; merged["Volume"]=None
+        merged = amc.copy(); merged["LTP"]=None; merged["Volume"]=None
 
     merged["PremLTPvsINAV"] = merged.apply(lambda r: pct(r["LTP"], r["iNAV"]), axis=1)
     merged["Timestamp"] = NOW
 
-    # history for sparklines
+    # History for sparklines
     snap = {"timestamp": NOW, "records": merged[["Symbol","Scheme","iNAV","AMC"]].to_dict(orient="records")}
     hist = HIST_DIR / f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
     with open(hist,"w",encoding="utf-8") as f: json.dump(snap,f)
 
-    # compact spark arrays
+    # Build compact spark arrays
     spark_map={}
     snaps = sorted(HIST_DIR.glob("snapshot_*.json"))[-10:]
     for fp in snaps:
@@ -199,16 +189,16 @@ def build_dataset():
                 key=r.get("Symbol") or r.get("Scheme")
                 if key: spark_map.setdefault(key,[]).append(r.get("iNAV"))
         except: pass
-
     merged["iNAV_hist"] = merged.apply(lambda r: spark_map.get(r["Symbol"] or r["Scheme"], [r["iNAV"]]), axis=1)
 
     cols=["AMC","Category","Scheme","Symbol","iNAV","Previous_NAV","PremDiscPct",
           "LTP","Volume","PremLTPvsINAV","iNAV_hist","Timestamp","Source"]
     final = merged[cols].sort_values(["AMC","Category","Scheme"]).fillna("")
     with open(DATA_DIR/"data.json","w",encoding="utf-8") as f:
-        json.dump(final.to_dict(orient="records"), f, ensure_ascii=False)
+        json.dump(final.to_dict(orient("records")), f, ensure_ascii=False)
 
     print(f"[OK] Built data/data.json with {len(final)} rows")
 
 if __name__ == "__main__":
     build_dataset()
+``
