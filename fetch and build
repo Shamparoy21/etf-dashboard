@@ -1,0 +1,205 @@
+# fetch_and_build.py
+# Builds data/data.json for the dashboard and maintains a simple history snapshot.
+# Requires: pandas, requests, bs4, lxml, playwright (chromium)
+
+import json, os, re, time, datetime as dt
+from pathlib import Path
+import pandas as pd
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+import requests
+
+DATA_DIR = Path('data'); DATA_DIR.mkdir(exist_ok=True)
+HIST_DIR = Path('history'); HIST_DIR.mkdir(exist_ok=True)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'}
+now = dt.datetime.utcnow().replace(microsecond=0).isoformat()+'Z'
+
+# ----------------------------
+# Source 1: NSE ETF Market Watch — LTP & Volume
+# ----------------------------
+# We will use Playwright (Chromium) to render the page and extract the table reliably.
+# Ref: NSE ETF Market Watch page lists ETF Symbol, LTP, NAV and other columns.
+NSE_URL = 'https://www.nseindia.com/market-data/exchange-traded-funds-etf/'
+
+def fetch_nse_etf_table():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--disable-gpu","--no-sandbox"])
+        context = browser.new_context(user_agent=UA['User-Agent'])
+        page = context.new_page()
+        page.goto(NSE_URL, wait_until='networkidle', timeout=120000)
+        # Allow dynamic table to render
+        page.wait_for_timeout(4000)
+        html = page.content()
+        browser.close()
+
+    soup = BeautifulSoup(html, 'lxml')
+    # Find the main table by scanning for headers we expect
+    table = None
+    for t in soup.find_all('table'):
+        ths = [th.get_text(strip=True).lower() for th in t.select('thead th')]
+        if any('symbol' in x for x in ths) and any('ltp' in x for x in ths):
+            table = t; break
+    rows = []
+    if table:
+        for tr in table.select('tbody tr'):
+            tds = [td.get_text(strip=True) for td in tr.find_all('td')]
+            if len(tds) < 5: continue
+            symbol = tds[0]
+            # Try to capture LTP and Volume by header index lookup
+            heads = [th.get_text(strip=True).lower() for th in table.select('thead th')]
+            def get_col(name):
+                for i,h in enumerate(heads):
+                    if name in h: return i
+                return None
+            i_ltp = get_col('ltp')
+            i_vol = get_col('volume')
+            ltp = float(tds[i_ltp].replace(',','')) if i_ltp is not None and tds[i_ltp] else None
+            vol = int(float(tds[i_vol].replace(',',''))) if i_vol is not None and tds[i_vol] else None
+            rows.append({'Symbol': symbol, 'LTP': ltp, 'Volume': vol, 'Exchange': 'NSE'})
+    return pd.DataFrame(rows)
+
+# ----------------------------
+# Source 2: AMC iNAV & Previous NAV tables
+# ----------------------------
+MIRAE_URL = 'https://miraeassetetf.co.in/inav-baskets?tab=inav'
+NIPPON_URL = 'https://etf.nipponindiaim.com/RealtimeNAV/nav/index'
+ZERODHA_URL = 'https://www.zerodhafundhouse.com/inav-summary'
+
+
+def fetch_mirae():
+    # Use Playwright to ensure dynamic content is loaded
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--disable-gpu","--no-sandbox"])
+        page = browser.new_page()
+        page.goto(MIRAE_URL, wait_until='networkidle', timeout=120000)
+        page.wait_for_timeout(4000)
+        html = page.content()
+        browser.close()
+    soup = BeautifulSoup(html, 'lxml')
+    rows = []
+    for tr in soup.select('table tbody tr'):
+        tds = [td.get_text(strip=True) for td in tr.find_all('td')]
+        if len(tds) < 4: continue
+        scheme = tds[1]
+        inav = tds[2]; nav = tds[3]
+        try:
+            inav_v = float(inav.replace(',',''))
+        except: inav_v = None
+        try:
+            nav_v = float(nav.replace(',',''))
+        except: nav_v = None
+        rows.append({'AMC':'Mirae Asset','Scheme':scheme,'Symbol':tds[0] if tds[0] else None,'iNAV':inav_v,'Previous_NAV':nav_v,'Source':'Mirae'})
+    return pd.DataFrame(rows)
+
+
+def fetch_nippon():
+    r = requests.get(NIPPON_URL, headers=UA, timeout=60)
+    soup = BeautifulSoup(r.text, 'lxml')
+    rows=[]
+    for tr in soup.select('table tbody tr'):
+        tds = [td.get_text(strip=True) for td in tr.find_all('td')]
+        if len(tds) < 4: continue
+        scheme = tds[0]
+        inav = tds[1]; nav = tds[2]
+        def f(x):
+            try: return float(x.replace(',',''))
+            except: return None
+        rows.append({'AMC':'Nippon India Mutual Fund','Scheme':scheme,'Symbol':None,'iNAV':f(inav),'Previous_NAV':f(nav),'Source':'Nippon'})
+    return pd.DataFrame(rows)
+
+
+def fetch_zerodha():
+    r = requests.get(ZERODHA_URL, headers=UA, timeout=60)
+    soup = BeautifulSoup(r.text, 'lxml')
+    rows=[]
+    # The Zerodha page lists a small table of iNAV/prev NAV
+    for tr in soup.select('table tbody tr'):
+        tds = [td.get_text(strip=True) for td in tr.find_all('td')]
+        if len(tds) < 3: continue
+        scheme = tds[0]
+        inav = tds[1]; nav = tds[2]
+        def f(x):
+            try: return float(x.replace('₹','').replace(',',''))
+            except: return None
+        rows.append({'AMC':'Zerodha Fund House','Scheme':scheme,'Symbol':None,'iNAV':f(inav),'Previous_NAV':f(nav),'Source':'Zerodha'})
+    return pd.DataFrame(rows)
+
+# ----------------------------
+# Merge + compute + history
+# ----------------------------
+
+def categorize(row):
+    s = f"{row.get('AMC','')} {row.get('Scheme','')}".lower()
+    def test(rx):
+        import re
+        return bool(re.search(rx, s))
+    if test(r"nifty\s?(50|100|200|next\s?50|midcap|sensex)"): return 'Index'
+    if test(r"bank|psu|it|pharma|auto|metal|energy|infra|financial"): return 'Sector'
+    if test(r"fang|hang\s?sheng|s&p|top\s?50"): return 'International'
+    if test(r"gold|silver"): return 'Commodity'
+    if test(r"g-?sec|sdl|liquid|1d rate"): return 'Debt'
+    if test(r"alpha|low volatility|momentum|quality|consumption|manufacturing|dividend|equal weight|internet|ev|new age"): return 'Smart Beta / Thematic'
+    return 'Other'
+
+
+def build_dataset():
+    # Fetch all
+    nse = fetch_nse_etf_table()
+    mirae = fetch_mirae()
+    nippon = fetch_nippon()
+    zero = fetch_zerodha()
+
+    amc = pd.concat([mirae, nippon, zero], ignore_index=True)
+    # Compute basic premium iNAV vs Prev NAV
+    amc['PremDiscPct'] = (amc['iNAV'] / amc['Previous_NAV'] - 1.0) * 100
+
+    # Symbol mapping: prefer AMC-provided Symbol where available; else try approximate join by scheme keywords
+    # Start with left join on Symbol (exact)
+    out = amc.copy()
+    out['Symbol'] = out['Symbol'].fillna('')
+
+    # Join with NSE by best-effort using direct symbol match; if empty, try name containment heuristics
+    merged = out.merge(nse, how='left', on='Symbol')
+
+    # Heuristic: for rows with missing LTP but scheme contains a known symbol (rare), skip for now
+
+    # Category, timestamps
+    merged['Category'] = merged.apply(categorize, axis=1)
+    merged['PremLTPvsINAV'] = (merged['LTP'] / merged['iNAV'] - 1.0) * 100
+    merged['Timestamp'] = now
+
+    # Minimal history: keep last 10 points of iNAV per Symbol for sparkline
+    # Load prior, append and trim
+    hist_path = HIST_DIR / f"snapshot_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M')}.json"
+    # Save snapshot of current iNAVs
+    hist_records = merged[['Symbol','Scheme','iNAV','AMC']].to_dict(orient='records')
+    with open(hist_path, 'w') as f: json.dump({'timestamp': now, 'records': hist_records}, f)
+
+    # Build compact sparkline arrays (best effort per Symbol)
+    spark_map = {}
+    # Load previous 9 snapshots
+    snaps = sorted(HIST_DIR.glob('snapshot_*.json'))[-10:]
+    for fp in snaps:
+        j = json.loads(fp.read_text())
+        for r in j['records']:
+            sym = r.get('Symbol') or r.get('Scheme')
+            if not sym: continue
+            spark_map.setdefault(sym, []).append(r.get('iNAV'))
+
+    merged['iNAV_hist'] = merged.apply(lambda r: spark_map.get(r['Symbol'] or r['Scheme'], [r['iNAV']]), axis=1)
+
+    # Output JSON
+    cols = ['AMC','Category','Scheme','Symbol','iNAV','Previous_NAV','PremDiscPct','LTP','Volume','PremLTPvsINAV','iNAV_hist','Timestamp','Source']
+    final = merged[cols].sort_values(['AMC','Category','Scheme']).fillna('')
+    out_path = DATA_DIR / 'data.json'
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(out_path, 'w') as f:
+        json.dump(final.to_dict(orient='records'), f, ensure_ascii=False)
+
+if __name__ == '__main__':
+    build_dataset()
+    print('Built data/data.json')
